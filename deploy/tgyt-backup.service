@@ -1,0 +1,10 @@
+[Unit]
+Description=tgyt-uploader scheduled backup (local copy, plus the off-site copy when configured)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/tgyt backup scheduled
+Nice=10
+IOSchedulingClass=idle

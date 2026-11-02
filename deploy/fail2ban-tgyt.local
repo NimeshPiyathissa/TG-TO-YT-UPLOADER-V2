@@ -1,0 +1,16 @@
+# Installed to /etc/fail2ban/jail.d/tgyt.local by the TG→YT installer (only if that file does not exist yet,
+# so your own changes survive a re-run).
+#
+# banaction = ufw: ufw accepts already-established connections before its own rules, so a ban only blocks
+# NEW connections from that address. An SSH session you already have open is never cut off by a ban.
+[DEFAULT]
+banaction          = ufw
+banaction_allports = ufw
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+ignoreip = 127.0.0.1/8 ::1
+
+[sshd]
+enabled = true
+backend = systemd

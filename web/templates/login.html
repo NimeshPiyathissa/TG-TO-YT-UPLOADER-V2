@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Log in — TG→YT Uploader{% endblock %}
+{% block guest_content %}
+{% from "partials/_icons.html" import icon %}
+<div class="login-wrap">
+  <form method="post" action="/login" class="login-card">
+    <div class="login-brand"><span class="tally"></span>TG→YT</div>
+    <div class="login-route" aria-hidden="true">
+      <span class="n">{{ icon("tg") }}</span><span class="l"></span><span class="n">{{ icon("srv") }}</span><span class="l"></span><span class="n">{{ icon("yt") }}</span>
+    </div>
+    <h1>Log in</h1>
+    <p class="lede">Manage the Telegram-to-YouTube uploader.</p>
+    {% if error %}<div class="flash flash-error" role="alert">{{ error }}</div>{% endif %}
+    <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+    <label>Username
+      <input type="text" name="username" value="{{ username or '' }}" autocomplete="username" autofocus required>
+    </label>
+    <label>Password
+      <input type="password" name="password" autocomplete="current-password" required>
+    </label>
+    {% if needs_totp %}
+    <label>Authentication code
+      <input type="text" name="totp_code" inputmode="numeric" pattern="[0-9]*" autocomplete="one-time-code" required autofocus>
+    </label>
+    {% endif %}
+    <button type="submit" class="btn btn-primary">Log in</button>
+  </form>
+  <p class="who" style="text-align:center"><a href="{{ source_code_url }}" rel="noopener" target="_blank">Source code (AGPL-3.0)</a></p>
+</div>
+{% endblock %}

@@ -1,0 +1,898 @@
+#!/usr/bin/env bash
+# tgyt — management command for the TG → YT Uploader (installed as /usr/local/bin/tgyt).
+#   tgyt help
+set -Eeuo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+SELF_DIR="$(dirname "$SELF")"
+# shellcheck source=lib/validate.sh
+source "$SELF_DIR/lib/validate.sh"
+# shellcheck source=lib/common.sh
+source "$SELF_DIR/lib/common.sh"
+
+INSTALL_DIR="${TGYT_INSTALL_DIR:-/opt/tgyt-uploader}"
+SRC_DIR="${TGYT_SRC_DIR:-/opt/tgyt-src}"
+ROLLBACK_DIR="${TGYT_ROLLBACK_DIR:-/opt/tgyt-rollback}"
+ENV_FILE="${TGYT_ENV_FILE:-/etc/tgyt/tgyt.env}"
+ENV_DIR="$(dirname "$ENV_FILE")"
+BACKUP_DIR="${TGYT_BACKUP_DIR:-/var/backups/tgyt}"
+SERVICE_USER="tgyt"
+VENV_PY="$INSTALL_DIR/venv/bin/python"
+LOG_FILE="/var/log/tgyt-manage.log"
+[[ -t 0 ]] || NONINTERACTIVE=1   # cron/systemd/ssh-without-tty: never block on a prompt
+VERSION="$(tr -d '[:space:]' <"$INSTALL_DIR/VERSION" 2>/dev/null || echo unknown)"
+
+as_service() { (cd "$INSTALL_DIR" 2>/dev/null || cd /tmp; sudo -u "$SERVICE_USER" "$@"); }
+need_root() {
+    if [[ $EUID -ne 0 ]]; then
+        # Name the variables to keep: sudo-rs (Ubuntu 26.04+) ignores a bare -E.
+        local v preserve=()
+        for v in TGYT_ENV_FILE TGYT_INSTALL_DIR TGYT_SRC_DIR TGYT_ROLLBACK_DIR TGYT_BACKUP_DIR TGYT_OFFSITE_DIR TGYT_BACKUP_PASSPHRASE NO_COLOR; do
+            [[ -n "${!v:-}" ]] && preserve+=("$v")
+        done
+        if ((${#preserve[@]})); then
+            exec sudo "--preserve-env=$(IFS=,; echo "${preserve[*]}")" "$SELF" "$@"
+        fi
+        exec sudo "$SELF" "$@"
+    fi
+}
+env_val() { env_get "$ENV_FILE" "$1"; }
+web_url() {
+    local host port suffix=""
+    host="$(env_val PUBLIC_HOST)"; port="$(env_val WEB_PORT)"; port="${port:-443}"
+    [[ "$port" != "443" ]] && suffix=":$port"
+    if [[ "$(env_val OAUTH_MODE)" == "loopback" || -z "$host" ]]; then host="$(env_val PUBLIC_IP)"; fi
+    printf 'https://%s%s' "$host" "$suffix"
+}
+internal_url() {
+    if [[ "$(env_val OAUTH_MODE)" == "loopback" ]]; then printf 'https://127.0.0.1:%s' "$(env_val WEB_PORT)"; else printf 'http://127.0.0.1:8001'; fi
+}
+
+usage() {
+    cat <<EOF
+${C_BOLD}tgyt${C_OFF} v$VERSION — manage the TG → YT Uploader
+
+  tgyt status                 service state, address, certificate, disk, channels
+  tgyt logs [-f] [-n N]       show (or follow) the service log
+  tgyt restart | start | stop control the service
+  tgyt doctor [--deep]        check everything and tell me how to fix problems
+  tgyt config [KEY [VALUE]]   show settings, or change one safely (then restarts)
+  tgyt relay                  (re)run the large-file relay setup (Telegram login)
+  tgyt relay-test             test big-file downloads end to end (pauses the service while it runs)
+  tgyt admin                  reset the panel password / lost authenticator / create an admin
+  tgyt backup [--encrypt] [--out DIR] [--keep N] [--quiet]
+  tgyt backup schedule on|off|status
+  tgyt offsite setup|run|status|restore-test|restore   encrypted off-site copies (Backblaze B2 / S3, restic)
+  tgyt restore FILE           restore a backup made by 'tgyt backup'
+  tgyt update [--ref REF] [--from DIR] [-y]    upgrade (automatic rollback if it fails)
+  tgyt rollback               go back to the version before the last update
+  tgyt uninstall              remove the service (asks before touching any data)
+  tgyt version
+EOF
+}
+
+# =========================================================================================
+cmd_status() {
+    echo "${C_BOLD}TG → YT Uploader${C_OFF} v$VERSION"
+    local active since
+    active="$(systemctl is-active tgyt 2>/dev/null || true)"
+    since="$(systemctl show tgyt -p ActiveEnterTimestamp --value 2>/dev/null || true)"
+    if [[ "$active" == "active" ]]; then ok "Service: running since ${since:-?}"; else err "Service: $active"; fi
+    info "Panel      : $(web_url)"
+    info "Mode       : $(env_val OAUTH_MODE)   Bot owner ID: $(env_val OWNER_TG_ID)"
+    local relay="not configured (videos over 20 MB are rejected)"
+    [[ -n "$(env_val USER_SESSION)" ]] && relay="configured, max file $(human_bytes "$(env_val MAX_FILE_BYTES)")"
+    info "Relay      : $relay"
+    local host; host="$(env_val PUBLIC_HOST)"
+    if [[ -n "$host" && -s "/etc/letsencrypt/live/$host/cert.pem" ]]; then
+        info "Certificate: expires $(openssl x509 -enddate -noout -in "/etc/letsencrypt/live/$host/cert.pem" | cut -d= -f2)"
+    fi
+    info "Disk (jobs): $(df -h --output=avail "$(env_val JOBS_DIR)" 2>/dev/null | tail -n1 | tr -d ' ') free"
+    local db; db="$(env_val DB_PATH)"
+    if [[ -f "$db" ]] && need_cmd sqlite3; then
+        info "Channels   : $(sqlite3 -readonly "$db" 'select count(*) from yt_channels' 2>/dev/null || echo ?) linked, $(sqlite3 -readonly "$db" "select count(*) from jobs where status not in ('DONE','FAILED','CANCELLED')" 2>/dev/null || echo ?) active job(s)"
+    fi
+    local last; last="$(find "$BACKUP_DIR" -maxdepth 1 -name 'tgyt-backup-*' -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -n1 | cut -d' ' -f2- || true)"
+    info "Last backup: ${last:-none yet — run: sudo tgyt backup}"
+    if [[ -r "$OFFSITE_DIR/last-success" ]]; then info "Off-site   : last upload $(cat "$OFFSITE_DIR/last-success")"
+    elif [[ $EUID -eq 0 ]]; then info "Off-site   : not set up (sudo tgyt offsite setup)"; fi
+}
+
+cmd_logs() {
+    local follow=0 n=100
+    while (($#)); do case "$1" in -f | --follow) follow=1 ;; -n) n="${2:-100}"; shift ;; esac; shift; done
+    if ((follow)); then exec journalctl -u tgyt -f -n "$n" -o cat --no-pager; fi
+    journalctl -u tgyt -n "$n" -o cat --no-pager
+}
+
+cmd_service() {  # start|stop|restart
+    need_root "$@"
+    systemctl "$1" tgyt
+    sleep 2
+    if [[ "$1" == "stop" ]]; then ok "Stopped."; return; fi
+    if systemctl is-active --quiet tgyt; then ok "tgyt is running."; else err "tgyt is not running. See: tgyt logs"; return 1; fi
+}
+
+# =========================================================================================
+cmd_doctor() {
+    need_root doctor "$@"
+    local deep=0 fails=0 warns=0
+    [[ "${1:-}" == "--deep" ]] && deep=1
+    check() { # check STATUS NAME DETAIL FIX
+        case "$1" in
+            ok) printf '  %s✔%s %-34s %s\n' "$C_GREEN" "$C_OFF" "$2" "$3" ;;
+            warn) printf '  %s⚠%s %-34s %s\n' "$C_YELLOW" "$C_OFF" "$2" "$3"; warns=$((warns + 1)) ;;
+            *) printf '  %s✖%s %-34s %s\n' "$C_RED" "$C_OFF" "$2" "$3"; fails=$((fails + 1)) ;;
+        esac
+        [[ "$1" != "ok" && -n "${4:-}" ]] && printf '      %s→ Fix: %s%s\n' "$C_DIM" "$4" "$C_OFF"
+        return 0
+    }
+    echo "${C_BOLD}tgyt doctor${C_OFF} (v$VERSION)"
+    local oauth host port code
+    oauth="$(env_val OAUTH_MODE)"; host="$(env_val PUBLIC_HOST)"; port="$(env_val WEB_PORT)"; port="${port:-443}"
+
+    # ---- service
+    if systemctl is-active --quiet tgyt; then
+        local restarts started age
+        restarts="$(systemctl show tgyt -p NRestarts --value 2>/dev/null || echo 0)"
+        started="$(systemctl show tgyt -p ActiveEnterTimestampMonotonic --value 2>/dev/null || echo 0)"
+        age=$(( ($(awk '{printf "%d", $1*1000000}' /proc/uptime) - started) / 1000000 ))
+        if [[ "$restarts" -gt 0 && "$age" -lt 120 ]]; then
+            check fail "Service" "running but restarted $restarts time(s) in the last $age s (crash loop?)" "tgyt logs   — look for 'FATAL' or 'Traceback'"
+        else
+            check ok "Service" "tgyt.service active for $((age / 60)) min, $restarts restart(s)"
+        fi
+    else
+        check fail "Service" "tgyt.service is $(systemctl is-active tgyt 2>/dev/null || true)" "tgyt logs -n 50   then   tgyt restart"
+    fi
+    if systemctl is-enabled --quiet tgyt 2>/dev/null; then check ok "Auto-start on boot" "enabled"; else check warn "Auto-start on boot" "not enabled" "systemctl enable tgyt"; fi
+
+    # ---- recent log errors
+    local errs
+    errs="$(journalctl -u tgyt --since '30 min ago' --no-pager -o cat 2>/dev/null | grep -Eic 'traceback|"level": ?"(error|critical)"|fatal' || true)"
+    if [[ "${errs:-0}" -eq 0 ]]; then check ok "Recent log" "no errors in the last 30 minutes"
+    else check warn "Recent log" "$errs error line(s) in the last 30 minutes" "tgyt logs -n 200 | grep -iE 'error|traceback|fatal'"; fi
+
+    # ---- web panel
+    code="$(curl -ksS -o /dev/null -w '%{http_code}' --max-time 8 "$(internal_url)/login" 2>/dev/null || true)"
+    if [[ "$code" == "200" ]]; then check ok "Panel (local)" "answers on $(internal_url)/login (HTTP 200)"
+    else check fail "Panel (local)" "HTTP $code from $(internal_url)/login" "tgyt logs; make sure the service is running"; fi
+
+    if [[ "$oauth" == "hostname" && -n "$host" ]]; then
+        # real certificate validation against the real hostname, but via the local nginx (no hairpin NAT issues)
+        local curl_err why=""; curl_err="$(mktemp)"
+        code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 --resolve "$host:$port:127.0.0.1" "https://$host:$port/login" 2>"$curl_err" || true)"
+        [[ -s "$curl_err" ]] && why=": $(head -n1 "$curl_err" | cut -c1-120)"
+        rm -f "$curl_err"
+        if [[ "$code" == "200" ]]; then check ok "HTTPS + certificate" "https://$host:$port/login valid (HTTP 200)"
+        else check fail "HTTPS + certificate" "https://$host:$port/login failed (HTTP $code$why)" "Certificate missing/invalid? Re-run the installer after fixing DNS and port 80 (docs/troubleshooting.md#ssl)"; fi
+        local cert="/etc/letsencrypt/live/$host/cert.pem" days
+        if [[ -s "$cert" ]]; then
+            days=$(( ($(date -d "$(openssl x509 -enddate -noout -in "$cert" | cut -d= -f2)" +%s) - $(date +%s)) / 86400 ))
+            if ((days < 10)); then check fail "Certificate expiry" "$days days left" "certbot renew   (check: systemctl status certbot.timer)"
+            elif ((days < 25)); then check warn "Certificate expiry" "$days days left (renews automatically at 30)" "systemctl list-timers certbot.timer"
+            else check ok "Certificate expiry" "$days days left"; fi
+        else
+            check warn "Certificate expiry" "no Let's Encrypt certificate for $host" "Re-run the installer once DNS points here"
+        fi
+        if systemctl is-active --quiet certbot.timer; then check ok "Certificate auto-renewal" "certbot.timer is active"
+        else check fail "Certificate auto-renewal" "certbot.timer is not active" "systemctl enable --now certbot.timer"; fi
+        if ((deep)); then
+            # Without a terminal certbot first sleeps a random 0-8 minutes (load spreading for cron jobs).
+            if certbot renew --dry-run --no-random-sleep-on-renew >/dev/null 2>&1; then check ok "Renewal dry run" "certbot renew --dry-run succeeded"
+            else check fail "Renewal dry run" "renewal test failed" "certbot renew --dry-run   (read the error; usually DNS or port 80)"; fi
+        fi
+        # public reachability (may legitimately fail behind hairpin-NAT providers)
+        code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 8 "https://$host:$port/login" 2>/dev/null || true)"
+        local seen_ip public_ip
+        seen_ip="$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR==1{print $1}')"; public_ip="$(env_val PUBLIC_IP)"
+        if [[ "$code" == "200" ]]; then check ok "Reachable from outside" "public request to https://$host:$port works"
+        elif [[ -n "$seen_ip" && -n "$public_ip" && "$seen_ip" != "$public_ip" ]]; then
+            check warn "Reachable from outside" "this server's DNS still returns $seen_ip for $host (this server is $public_ip)" \
+                "If you just changed the A record, the old answer is cached; it clears within the record's TTL. Check: dig +short $host @1.1.1.1"
+        else check warn "Reachable from outside" "public request returned HTTP $code" "Open ports 80 and $port in your VPS provider's firewall; confirm the DNS A record"; fi
+        # nginx
+        if systemctl is-active --quiet nginx && nginx -t >/dev/null 2>&1; then check ok "nginx" "running, configuration valid"
+        else check fail "nginx" "not running or configuration invalid" "nginx -t   then   systemctl restart nginx"; fi
+        if grep -q 'location = /events' /etc/nginx/sites-enabled/tgyt.conf 2>/dev/null && grep -q 'proxy_buffering off' /etc/nginx/sites-enabled/tgyt.conf; then
+            code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 8 --resolve "$host:$port:127.0.0.1" "https://$host:$port/events" 2>/dev/null || true)"
+            if [[ "$code" =~ ^(200|303|401)$ ]]; then check ok "Live progress (/events)" "endpoint answers (HTTP $code; login required) and nginx streaming is configured"
+            else check fail "Live progress (/events)" "HTTP $code" "tgyt logs"; fi
+        else
+            check warn "Live progress (/events)" "nginx is not set up for streaming" "Re-run the installer to refresh the nginx config"
+        fi
+    elif [[ "$oauth" == "loopback" ]]; then
+        check ok "HTTPS" "loopback mode: self-signed certificate (browser warning is expected)"
+    fi
+
+    # ---- application checks (bot token, relay, database, OAuth client, channels, key, disk)
+    local line st name detail fix
+    while IFS=$'\t' read -r st name detail fix; do
+        [[ -n "$st" ]] && check "$st" "$name" "$detail" "$fix"
+    done < <(as_service env TGYT_ENV_FILE="$ENV_FILE" "$VENV_PY" "$INSTALL_DIR/tools/doctor_checks.py" --plain --env-file "$ENV_FILE" 2>&1 || true)
+
+    # ---- file permissions
+    local perm
+    perm="$(stat -c '%a %U' "$ENV_FILE" 2>/dev/null || echo '? ?')"
+    if [[ "$perm" == "600 $SERVICE_USER" ]]; then check ok "Env file permissions" "$ENV_FILE is 600, owned by $SERVICE_USER"
+    else check fail "Env file permissions" "$ENV_FILE is $perm" "chown $SERVICE_USER:$SERVICE_USER $ENV_FILE && chmod 600 $ENV_FILE"; fi
+
+    # ---- firewall / fail2ban / ssh
+    if need_cmd ufw && ufw status | grep -q 'Status: active'; then
+        local missing=""
+        for p in 80 "$port"; do ufw status | grep -qE "^$p(/tcp)? +ALLOW" || missing+=" $p"; done
+        if [[ -z "$missing" ]]; then check ok "Firewall (ufw)" "active; ports 80 and $port open"
+        else check warn "Firewall (ufw)" "active but not allowing:$missing" "ufw allow <port>/tcp"; fi
+    else
+        check warn "Firewall (ufw)" "not active" "ufw allow OpenSSH && ufw allow 80/tcp && ufw allow $port/tcp && ufw enable"
+    fi
+    if systemctl is-active --quiet fail2ban; then check ok "fail2ban" "active"; else check warn "fail2ban" "not active" "apt install fail2ban && systemctl enable --now fail2ban"; fi
+    if command -v sshd >/dev/null 2>&1; then
+        local pwauth; pwauth="$(sshd -T 2>/dev/null | awk '/^passwordauthentication /{print $2}')"
+        if [[ "$pwauth" == "no" ]]; then check ok "SSH" "password login disabled (key-only)"
+        else check warn "SSH" "password login is allowed" "optional: re-run the installer and choose 'Harden SSH' once your SSH key works"; fi
+    fi
+
+    # ---- backups
+    local lastb age_days
+    lastb="$(find "$BACKUP_DIR" -maxdepth 1 -name 'tgyt-backup-*' -printf '%T@\n' 2>/dev/null | sort -n | tail -n1 | cut -d. -f1 || true)"
+    if [[ -z "$lastb" ]]; then check warn "Backups" "no backup yet" "tgyt backup   (then copy it off this server)"
+    else
+        age_days=$(( ($(date +%s) - lastb) / 86400 ))
+        if ((age_days > 7)); then check warn "Backups" "last backup is $age_days days old" "tgyt backup"; else check ok "Backups" "last backup $age_days day(s) ago"; fi
+    fi
+    if offsite_configured; then
+        local last_off off_days
+        last_off="$(cat "$OFFSITE_DIR/last-success" 2>/dev/null || true)"
+        if [[ -z "$last_off" ]]; then check fail "Off-site backup" "configured but never succeeded" "tgyt offsite run"
+        else
+            off_days=$(( ($(date +%s) - $(date -d "$last_off" +%s)) / 86400 ))
+            if ((off_days > 2)); then check fail "Off-site backup" "last upload $off_days days ago" "tgyt offsite run   then   journalctl -u tgyt-backup -n 50"
+            else check ok "Off-site backup" "last upload $off_days day(s) ago"; fi
+        fi
+    else
+        check warn "Off-site backup" "not set up: a lost server means lost keys" "tgyt offsite setup"
+    fi
+
+    echo
+    if ((fails)); then err "$fails problem(s) need attention, $warns warning(s)."
+    elif ((warns)); then warn "No failures; $warns warning(s) above."
+    else ok "All checks passed."; fi
+    cat <<EOF
+
+${C_BOLD}Test these by hand:${C_OFF}
+  Telegram:  1. send /start to your bot            → welcome message with your ID
+             2. send a SMALL video (<20 MB)         → "pick a channel" buttons appear
+             3. send a LARGE video (>20 MB)         → progress bar starts (needs the relay)
+             4. /channels, /jobs, /status           → lists respond
+  Panel:     5. open $(web_url) and log in (with your authenticator code if enabled)
+             6. Channels → link a channel (Google consent; click 'Advanced → Go to … (unsafe)')
+             7. Dashboard shows live progress while a job uploads; Settings shows the quota
+             8. Users → grant a second Telegram account the 'uploader' role and test it
+EOF
+    ((fails == 0))
+}
+
+# =========================================================================================
+# The bot's login is saved in tgyt-bot.session and reused on start, ignoring BOT_TOKEN. After a token
+# change (or revoke) that login is dead, so move it aside: the next start logs in with the new token.
+# Renaming is safe while the service runs; it keeps using the open file until it stops.
+bot_session_set_aside() {
+    local dir f ts; dir="$(dirname "$(env_val DB_PATH)")"; [[ "$dir" == "." ]] && dir=/var/lib/tgyt
+    ts="$(date +%Y%m%d-%H%M%S)"
+    for f in "$dir/tgyt-bot.session" "$dir/tgyt-bot.session-journal"; do
+        [[ -e "$f" ]] || continue
+        mv -n "$f" "$f.old-$ts" && chmod 600 "$f.old-$ts"
+    done
+    [[ -e "$dir/tgyt-bot.session.old-$ts" ]] && ok "Old bot login kept as $dir/tgyt-bot.session.old-$ts; the bot logs in with the new token on restart."
+    return 0
+}
+
+cmd_config() {
+    local key="${1:-}" value="${2:-}"
+    if [[ -z "$key" ]]; then
+        need_root config
+        echo "Settings in $ENV_FILE (secrets hidden). Change one with: sudo tgyt config KEY [VALUE]"
+        local line k v
+        while IFS= read -r line; do
+            [[ -z "$line" || "$line" == \#* || "$line" != *=* ]] && continue
+            k="${line%%=*}"; v="${line#*=}"
+            if is_sensitive_key "$k"; then [[ -n "$v" ]] && v="********(set)" || v="(empty)"; fi
+            printf '  %-26s %s\n' "$k" "$v"
+        done <"$ENV_FILE"
+        return
+    fi
+    key="${key^^}"
+    need_root config "$key" ${2:+"$2"}
+    local validator; validator="$(validator_for_key "$key")"
+    if [[ -z "$validator" ]]; then
+        die "'$key' is not a setting you can change with this command." "Known: API_ID API_HASH BOT_TOKEN OWNER_TG_ID USER_SESSION RELAY_CHAT_ID PUBLIC_HOST WEB_PORT OAUTH_MODE PROJECT_AUDITED REQUIRE_TOTP YT_REGION_CODE MAX_FILE_BYTES UPLOAD_CHUNK_BYTES MAX_CONCURRENT_DOWNLOADS MAX_CONCURRENT_UPLOADS DEFAULT_PRIVACY JOB_RETENTION_HOURS MIN_FREE_DISK_BYTES LOG_LEVEL" "Anything else: edit $ENV_FILE by hand, then 'tgyt restart'."
+    fi
+    if [[ -z "$value" ]]; then
+        if is_sensitive_key "$key"; then read -r -s -p "  New value for $key (hidden): " value; echo
+        else echo "  Current value: $(env_val "$key")"; read -r -p "  New value for $key: " value; fi
+    fi
+    if ! "$validator" "$value"; then die "'$key' rejected: the value is not valid for this setting (checked with $validator)."; fi
+    register_secret "$value"
+    local old_value; old_value="$(env_val "$key")"
+    cp -p "$ENV_FILE" "$BACKUP_DIR/tgyt.env.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+    env_set "$ENV_FILE" "$key" "$value"
+    chown "$SERVICE_USER:$SERVICE_USER" "$ENV_FILE"; chmod 600 "$ENV_FILE"
+    ok "$key updated (previous file copied to $BACKUP_DIR)."
+    if [[ "$key" == "BOT_TOKEN" && "$value" != "$old_value" ]]; then bot_session_set_aside; fi
+    if [[ "$key" == "PUBLIC_HOST" || "$key" == "WEB_PORT" || "$key" == "OAUTH_MODE" ]]; then
+        warn "The web address changed: re-run the installer (sudo $INSTALL_DIR/deploy/install.sh) to update nginx and the certificate,"
+        warn "and update the redirect URI in Google Cloud Console."
+    fi
+    if confirm "Restart the service now so it takes effect?" y; then
+        systemctl restart tgyt; sleep 3
+        if systemctl is-active --quiet tgyt; then ok "Restarted."; else err "The service did not come back. Restore the old value: sudo tgyt config $key"; fi
+    fi
+}
+
+cmd_relay() {
+    need_root relay
+    cat <<EOF
+${C_BOLD}Large-file relay${C_OFF}
+You need first: a PRIVATE Telegram channel, your bot added to it as administrator (post + delete messages),
+and the relay account (a real Telegram account) as a member.
+EOF
+    "$VENV_PY" "$INSTALL_DIR/tools/generate_session.py" --env-file "$ENV_FILE"
+    chown "$SERVICE_USER:$SERVICE_USER" "$ENV_FILE"; chmod 600 "$ENV_FILE"
+    if confirm "Restart the service now?" y; then systemctl restart tgyt; sleep 3; if systemctl is-active --quiet tgyt; then ok "Restarted."; else err "Service not running: tgyt logs"; fi; fi
+}
+
+cmd_relay_test() {
+    need_root relay-test
+    [[ -n "$(env_val USER_SESSION)" ]] || die "The relay is not configured. Run: sudo tgyt relay"
+    echo "This pauses the bot while you send test files (the relay login must not be used twice at once)."
+    confirm "Stop the service for the test and start it again afterwards?" y || return 0
+    systemctl stop tgyt
+    # shellcheck disable=SC2064
+    trap "systemctl start tgyt" EXIT
+    local rc=0
+    as_service env TGYT_ENV_FILE="$ENV_FILE" "$VENV_PY" "$INSTALL_DIR/tools/relay_selftest.py" "$@" || rc=$?
+    trap - EXIT
+    systemctl start tgyt
+    return $rc
+}
+
+cmd_admin() {
+    need_root admin
+    local user choice
+    user="$(env_val ADMIN_USERNAME)"; user="${user:-admin}"
+    echo "  1) Reset the password of an admin (or create one)"
+    echo "  2) Remove the authenticator (lost phone) so the user can enrol a new one"
+    read -r -p "  Choose 1 or 2: " choice
+    read -r -p "  Admin username [$user]: " v; user="${v:-$user}"
+    if [[ "$choice" == "2" ]]; then
+        as_service env TGYT_ENV_FILE="$ENV_FILE" "$VENV_PY" "$INSTALL_DIR/tools/admin_user.py" --username "$user" --reset-totp
+    else
+        as_service env TGYT_ENV_FILE="$ENV_FILE" "$VENV_PY" "$INSTALL_DIR/tools/admin_user.py" --username "$user"
+    fi
+}
+
+# =========================================================================================
+# Checks an unpacked backup folder against its MANIFEST.txt; prints the files that don't match.
+# A manifest can't hold its own checksum. Backups made before 1.0.1 list one anyway (taken while the file was
+# still being written, so it never matches); that line is skipped, every real file is still checked.
+verify_manifest() {  # verify_manifest DIR
+    local dir="$1" sums bad
+    [[ -f "$dir/MANIFEST.txt" ]] || { err "The backup has no MANIFEST.txt."; return 1; }
+    sums="$(grep -E '^[0-9a-f]{64} [ *]' "$dir/MANIFEST.txt" | grep -vE '^[0-9a-f]{64} [ *]\./MANIFEST\.txt$' || true)"
+    [[ -n "$sums" ]] || { err "MANIFEST.txt in the backup lists no files."; return 1; }
+    if ! bad="$(cd "$dir" && sha256sum -c --quiet - <<<"$sums" 2>&1)"; then
+        err "These files in the backup do not match the checksums recorded when it was made:"
+        printf '    %s\n' "$bad" >&2
+        return 1
+    fi
+}
+
+make_backup() {  # make_backup OUTDIR ENCRYPT(0/1) -> prints the archive path
+    local outdir="$1" encrypt="$2" ts tmp archive pass="" db sums
+    ts="$(date +%Y%m%d-%H%M%S)"; tmp="$(mktemp -d)"
+    mkdir -p "$outdir"; chmod 700 "$outdir"
+    db="$(env_val DB_PATH)"
+    if [[ -f "$db" ]]; then
+        "$VENV_PY" - "$db" "$tmp/tgyt.db" <<'PY'
+import sqlite3, sys
+src = sqlite3.connect(sys.argv[1]); dst = sqlite3.connect(sys.argv[2])
+src.backup(dst); dst.close(); src.close()
+PY
+    fi
+    cp -p "$ENV_FILE" "$tmp/tgyt.env"
+    cp -p "$(env_val FERNET_KEY_PATH)" "$tmp/fernet.key" 2>/dev/null || warn "Fernet key not found - the backup is NOT usable for restoring tokens."
+    [[ -d "$ENV_DIR/tls" ]] && cp -a "$ENV_DIR/tls" "$tmp/tls"
+    [[ -f /etc/nginx/sites-available/tgyt.conf ]] && cp -p /etc/nginx/sites-available/tgyt.conf "$tmp/nginx-tgyt.conf"
+    # Checksums first: MANIFEST.txt must not exist yet, or it would list itself half-written.
+    sums="$(cd "$tmp" && find . -type f -print0 | sort -z | xargs -0 sha256sum)"
+    {
+        echo "tgyt-backup v1"
+        echo "version=$VERSION"
+        echo "created=$(date -Is)"
+        echo "host=$(hostname)"
+        printf '%s\n' "$sums"
+    } >"$tmp/MANIFEST.txt"
+    verify_manifest "$tmp" || { wipe_dir "$tmp"; die "The new backup failed its own checksum check, so it was not written."; }
+    archive="$outdir/tgyt-backup-$ts.tar.gz"
+    tar -C "$tmp" -czf "$archive" .
+    if ((encrypt)); then
+        if [[ -n "${TGYT_BACKUP_PASSPHRASE:-}" ]]; then pass="$TGYT_BACKUP_PASSPHRASE"; else
+            read -r -s -p "  Passphrase to encrypt the backup (remember it!): " pass; echo
+            local p2; read -r -s -p "  Repeat passphrase: " p2; echo
+            [[ "$pass" == "$p2" && -n "$pass" ]] || { rm -rf "$tmp" "$archive"; die "Passphrases differ or are empty."; }
+        fi
+        TGYT_P="$pass" openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:TGYT_P -in "$archive" -out "$archive.enc"
+        shred -u "$archive" 2>/dev/null || rm -f "$archive"; archive="$archive.enc"
+    fi
+    chmod 600 "$archive"
+    shred -u "$tmp"/tgyt.env "$tmp"/fernet.key 2>/dev/null || true
+    rm -rf "$tmp"
+    printf '%s' "$archive"
+}
+
+cmd_backup() {
+    need_root backup "$@"
+    if [[ "${1:-}" == "scheduled" ]]; then backup_scheduled; return; fi
+    if [[ "${1:-}" == "schedule" ]]; then
+        case "${2:-status}" in
+            on) cp "$INSTALL_DIR/deploy/tgyt-backup.service" "$INSTALL_DIR/deploy/tgyt-backup.timer" /etc/systemd/system/ 2>/dev/null || true
+                systemctl daemon-reload; systemctl enable --now tgyt-backup.timer &&
+                    ok "Nightly backup enabled (03:30), last 7 kept in $BACKUP_DIR$(offsite_configured && echo ', plus the off-site copy')" ;;
+            off) systemctl disable --now tgyt-backup.timer && ok "Scheduled backups disabled." ;;
+            *) systemctl list-timers tgyt-backup.timer --no-pager || true ;;
+        esac
+        return
+    fi
+    local encrypt=0 outdir="$BACKUP_DIR" keep=0 quiet=0
+    while (($#)); do case "$1" in
+        --encrypt) encrypt=1 ;; --out) outdir="${2:?}"; shift ;; --keep) keep="${2:?}"; shift ;; --quiet) quiet=1 ;;
+    esac; shift; done
+    local archive; archive="$(make_backup "$outdir" "$encrypt")"
+    if ((quiet)); then echo "backup written: $archive"; else
+        ok "Backup written: $archive ($(human_bytes "$(stat -c %s "$archive")"))"
+        warn "This file contains your database, env file AND the Fernet key. Anyone holding it can use your YouTube logins."
+        warn "Without the Fernet key the saved YouTube tokens can NOT be decrypted - never keep the key only on this server."
+        info "Copy it off the server, e.g. from your computer:  scp root@$(env_val PUBLIC_IP):$archive ."
+        ((encrypt)) || info "Tip: 'tgyt backup --encrypt' protects the file with a passphrase before you store it elsewhere."
+    fi
+    if ((keep > 0)); then
+        # shellcheck disable=SC2012
+        ls -1t "$outdir"/tgyt-backup-* 2>/dev/null | tail -n "+$((keep + 1))" | xargs -r rm -f --
+    fi
+}
+
+cmd_restore() {
+    need_root restore "$@"
+    local file="${1:-}"
+    [[ -n "$file" && -f "$file" ]] || die "Usage: tgyt restore /path/to/tgyt-backup-XXXX.tar.gz[.enc]"
+    local tmp work; tmp="$(mktemp -d)"; work="$file"
+    trap 'rm -rf "$tmp"' RETURN
+    if [[ "$file" == *.enc ]]; then
+        local pass="${TGYT_BACKUP_PASSPHRASE:-}"
+        [[ -n "$pass" ]] || { read -r -s -p "  Backup passphrase: " pass; echo; }
+        TGYT_P="$pass" openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:TGYT_P -in "$file" -out "$tmp/b.tar.gz" 2>/dev/null ||
+            die "Could not decrypt the backup (wrong passphrase?)."
+        work="$tmp/b.tar.gz"
+    fi
+    mkdir -p "$tmp/x"
+    tar -xzf "$work" -C "$tmp/x" || die "That file is not a valid backup archive."
+    [[ -f "$tmp/x/MANIFEST.txt" && -f "$tmp/x/tgyt.env" ]] || die "The archive does not look like a tgyt backup (no manifest/env file)."
+    verify_manifest "$tmp/x" || die "Checksum mismatch: this backup file is damaged or was changed. Nothing was changed on this server." \
+        "Use another backup: ls -lt $BACKUP_DIR   (or the off-site copy: sudo tgyt offsite restore-test)"
+    echo "Backup contents:"; sed -n '1,4p' "$tmp/x/MANIFEST.txt" | sed 's/^/    /'
+    if [[ -f "$tmp/x/tgyt.db" ]]; then info "includes: database"; fi
+    if [[ -f "$tmp/x/fernet.key" ]]; then info "includes: Fernet key"; else warn "NO Fernet key inside - restored YouTube tokens would be unreadable unless this server still has the original key."; fi
+    if [[ -f "$tmp/x/tgyt.db" ]] && ! "$VENV_PY" -c "import sqlite3,sys; sys.exit(0 if sqlite3.connect(sys.argv[1]).execute('pragma integrity_check').fetchone()[0]=='ok' else 1)" "$tmp/x/tgyt.db"; then
+        die "The database inside the backup fails its integrity check. Nothing was changed."
+    fi
+    warn "This REPLACES the current database, env file and Fernet key on this server."
+    if is_interactive && [[ "$ASSUME_YES" != "1" ]]; then
+        local a; read -r -p "  Type 'restore' to continue: " a; [[ "$a" == "restore" ]] || die "Cancelled. Nothing changed."
+    fi
+    local safety; safety="$(make_backup "$BACKUP_DIR" 0)"
+    ok "Safety copy of the current state: $safety"
+    systemctl stop tgyt
+    local db keyp; db="$(env_get "$tmp/x/tgyt.env" DB_PATH)"; db="${db:-/var/lib/tgyt/tgyt.db}"
+    keyp="$(env_get "$tmp/x/tgyt.env" FERNET_KEY_PATH)"; keyp="${keyp:-/etc/tgyt/fernet.key}"
+    install -m 0600 -o "$SERVICE_USER" -g "$SERVICE_USER" "$tmp/x/tgyt.env" "$ENV_FILE"
+    if [[ -f "$tmp/x/fernet.key" ]]; then
+        [[ -f "$keyp" ]] && chmod 600 "$keyp"
+        install -m 0400 -o "$SERVICE_USER" -g "$SERVICE_USER" "$tmp/x/fernet.key" "$keyp"
+    fi
+    if [[ -f "$tmp/x/tgyt.db" ]]; then
+        rm -f "$db-wal" "$db-shm"
+        install -m 0640 -o "$SERVICE_USER" -g "$SERVICE_USER" "$tmp/x/tgyt.db" "$db"
+    fi
+    if [[ -d "$tmp/x/tls" ]]; then cp -a "$tmp/x/tls/." "$ENV_DIR/tls/"; chown -R "$SERVICE_USER:$SERVICE_USER" "$ENV_DIR/tls"; fi
+    chown -R "$SERVICE_USER:$SERVICE_USER" "$(dirname "$db")"
+    systemctl start tgyt; sleep 4
+    if systemctl is-active --quiet tgyt; then ok "Restored and running."; else err "Restored, but the service did not start: tgyt logs"; fi
+    info "If this server's domain differs from the backup's, run the installer again to fix nginx/HTTPS."
+    cmd_doctor || true
+}
+
+# =========================================================================================
+# Off-site backups: the same archive `tgyt backup` makes, sent to S3-compatible storage
+# (Backblaze B2 by default) with restic, which encrypts it on this server before upload.
+#
+# The settings live in a root-only folder, NOT in /etc/tgyt: the service user can write to
+# /etc/tgyt, and root must never act on a file the app could have replaced. They are parsed
+# with env_get, never sourced.
+OFFSITE_DIR="${TGYT_OFFSITE_DIR:-/etc/tgyt-offsite}"
+OFFSITE_CONF="$OFFSITE_DIR/offsite.conf"
+OFFSITE_PASS="$OFFSITE_DIR/restic.pass"
+OFFSITE_STAGE="/var/backups/tgyt-offsite"
+
+is_s3_endpoint() { is_domain "$1"; }
+is_bucket_name() { [[ "$1" =~ ^[a-z0-9][a-z0-9-]{4,61}[a-z0-9]$ ]]; }
+is_access_key_id() { [[ "$1" =~ ^[A-Za-z0-9]{10,64}$ ]]; }
+is_access_key_secret() { [[ "$1" =~ ^[A-Za-z0-9/+=_-]{20,128}$ ]]; }
+
+offsite_configured() { [[ -s "$OFFSITE_CONF" && -s "$OFFSITE_PASS" ]]; }
+
+# Mask the storage key in everything this process logs. Must run in the main shell: `run` executes
+# commands in a subshell, so a secret registered there would not reach the parent's redaction.
+offsite_register_secrets() { offsite_configured && register_secret "$(env_get "$OFFSITE_CONF" SECRET_ACCESS_KEY)"; return 0; }
+
+# Delete a private temp folder that may hold decrypted secrets.
+wipe_dir() { [[ -n "${1:-}" && -d "$1" ]] || return 0; find "$1" -type f -exec shred -u {} + 2>/dev/null; rm -rf "$1"; }
+
+# Runs restic with the off-site settings in its environment only.
+offsite_restic() {
+    local endpoint bucket region
+    endpoint="$(env_get "$OFFSITE_CONF" ENDPOINT)"; bucket="$(env_get "$OFFSITE_CONF" BUCKET)"
+    region="$(sed -nE 's/^s3\.([a-z0-9-]+)\.backblazeb2\.com$/\1/p' <<<"$endpoint")"
+    RESTIC_REPOSITORY="s3:https://$endpoint/$bucket/tgyt" \
+        AWS_ACCESS_KEY_ID="$(env_get "$OFFSITE_CONF" ACCESS_KEY_ID)" \
+        AWS_SECRET_ACCESS_KEY="$(env_get "$OFFSITE_CONF" SECRET_ACCESS_KEY)" \
+        AWS_DEFAULT_REGION="${region:-us-east-1}" \
+        RESTIC_PASSWORD_FILE="$OFFSITE_PASS" \
+        RESTIC_CACHE_DIR=/var/cache/tgyt-restic \
+        restic "$@"
+}
+
+# Best-effort Telegram message to the bot owner. The token goes to curl on stdin, not on its command line.
+notify_owner() {
+    local token owner
+    token="$(env_val BOT_TOKEN)"; owner="$(env_val OWNER_TG_ID)"
+    [[ -n "$token" && -n "$owner" ]] || return 0
+    printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$token" |
+        curl -fsS -m 15 -K - --data-urlencode "chat_id=$owner" --data-urlencode "text=$1" >/dev/null 2>&1 || true
+}
+
+offsite_setup() {
+    need_cmd restic || retry 3 5 "Installing restic" bash -c 'export DEBIAN_FRONTEND=noninteractive; apt-get update -y && apt-get install -y restic' ||
+        die "Could not install restic."
+    cat <<EOF
+${C_BOLD}Off-site backup (Backblaze B2 or any S3-compatible storage)${C_OFF}
+Prepare in your Backblaze account first:
+  1. Buckets -> Create a Bucket: a unique name, Files in Bucket: ${C_BOLD}Private${C_OFF}. Note its "Endpoint" (s3.<region>.backblazeb2.com).
+  2. Application Keys -> Add a New Application Key: allow access to ${C_BOLD}that bucket only${C_OFF}, type "Read and Write".
+     Copy the keyID and the applicationKey (shown only once).
+The backup is encrypted on this server with a password you choose now. ${C_BOLD}Save that password in your password manager${C_OFF}:
+without it the backups cannot be restored, and it is the one thing you need if this server is lost.
+EOF
+    local endpoint="" bucket="" key_id="" key_secret="" pw="" pw2=""
+    ask endpoint "S3 endpoint (e.g. s3.us-west-004.backblazeb2.com)" is_s3_endpoint "" "" "Enter only the hostname, without https://"
+    ask bucket "Bucket name" is_bucket_name "" "" "6-63 characters: lowercase letters, digits and dashes."
+    ask key_id "keyID" is_access_key_id "" "" "Letters and digits only."
+    ask key_secret "applicationKey (hidden)" is_access_key_secret "" secret "That does not look like an application key."
+    is_interactive || die "Off-site setup needs a terminal for the encryption password."
+    while true; do
+        read -r -s -p "  Backup encryption password, at least 16 characters (hidden): " pw; echo
+        ((${#pw} >= 16)) || { err "At least 16 characters, please."; continue; }
+        read -r -s -p "  Repeat it: " pw2; echo
+        [[ "$pw" == "$pw2" ]] && break
+        err "The two passwords do not match."
+    done
+    register_secret "$pw"
+    install -d -m 0700 -o root -g root "$OFFSITE_DIR"
+    (umask 077
+        printf 'ENDPOINT=%s\nBUCKET=%s\nACCESS_KEY_ID=%s\nSECRET_ACCESS_KEY=%s\n' "$endpoint" "$bucket" "$key_id" "$key_secret" >"$OFFSITE_CONF.new"
+        printf '%s' "$pw" >"$OFFSITE_PASS.new")
+    mv -f "$OFFSITE_CONF.new" "$OFFSITE_CONF"; mv -f "$OFFSITE_PASS.new" "$OFFSITE_PASS"
+    pw=""; pw2=""; key_secret=""
+    offsite_register_secrets
+    ok "Settings saved in $OFFSITE_DIR (root only)."
+    if run "Connecting to the storage" offsite_restic cat config; then
+        ok "Using the existing backup repository in that bucket (the password matched)."
+    elif run "Creating a new encrypted backup repository" offsite_restic init; then
+        ok "Repository created."
+    else
+        die "Could not use the bucket." "Check the endpoint, bucket name and key (it must be allowed to read and write that bucket)." \
+            "If the bucket already holds a repository, the password must be the one used before."
+    fi
+    offsite_run
+    offsite_restore_test
+    cmd_backup schedule on
+    ok "Off-site backups are set up: every night after the local backup (03:30 server time)."
+}
+
+offsite_run() {
+    offsite_configured || die "Off-site backup is not set up. Run: sudo tgyt offsite setup"
+    install -d -m 0700 "$OFFSITE_STAGE"
+    local archive
+    archive="$(make_backup "$OFFSITE_STAGE" 0)"
+    mv -f "$archive" "$OFFSITE_STAGE/tgyt-backup.tar.gz"   # stable name: one file per snapshot
+    local rc=0
+    run "Uploading the encrypted backup" offsite_restic backup --host tgyt --tag tgyt "$OFFSITE_STAGE/tgyt-backup.tar.gz" || rc=1
+    shred -u "$OFFSITE_STAGE/tgyt-backup.tar.gz" 2>/dev/null || rm -f "$OFFSITE_STAGE/tgyt-backup.tar.gz"
+    ((rc == 0)) || die "The off-site upload failed." "Check the internet connection and the bucket key: sudo tgyt offsite status"
+    run "Applying retention (7 daily, 4 weekly, 6 monthly)" offsite_restic forget --host tgyt --tag tgyt \
+        --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --prune || warn "Retention cleanup failed; it is retried next time."
+    if [[ "$(date +%u)" == "7" ]]; then
+        run "Weekly integrity check (reads 5% of the stored data)" offsite_restic check --read-data-subset=5% ||
+            die "The weekly integrity check of the off-site backups failed." "Run: sudo tgyt offsite status"
+    fi
+    date -Is >"$OFFSITE_DIR/last-success"
+    ok "Off-site backup uploaded."
+}
+
+offsite_status() {
+    if ! offsite_configured; then warn "Off-site backup is not set up. Run: sudo tgyt offsite setup"; return 0; fi
+    info "Storage    : $(env_get "$OFFSITE_CONF" ENDPOINT) / $(env_get "$OFFSITE_CONF" BUCKET)"
+    info "Last upload: $(cat "$OFFSITE_DIR/last-success" 2>/dev/null || echo never)"
+    offsite_restic snapshots --host tgyt --compact 2>&1 | redact | tail -n 12 | sed 's/^/    /'
+}
+
+# Restores the newest off-site snapshot into $1 (a private temp dir) and prints the archive path.
+offsite_fetch_latest() {
+    offsite_restic restore latest --host tgyt --tag tgyt --target "$1" >/dev/null || die "Could not download the latest off-site backup."
+    find "$1" -type f -name 'tgyt-backup.tar.gz' | head -n1
+}
+
+offsite_restore_test() {
+    offsite_configured || die "Off-site backup is not set up. Run: sudo tgyt offsite setup"
+    local tmp archive
+    tmp="$(mktemp -d)"
+    # shellcheck disable=SC2064  # expand $tmp now; EXIT (not RETURN) so it also runs when die() exits
+    trap "wipe_dir '$tmp'" EXIT
+    archive="$(offsite_fetch_latest "$tmp")"
+    [[ -n "$archive" ]] || die "The latest snapshot contains no backup archive."
+    mkdir -p "$tmp/x"; tar -xzf "$archive" -C "$tmp/x" || die "The downloaded archive is damaged."
+    verify_manifest "$tmp/x" || die "Checksum mismatch inside the downloaded off-site backup." \
+        "Check the stored data: sudo tgyt offsite status, then make a fresh copy with: sudo tgyt offsite run"
+    if [[ -f "$tmp/x/tgyt.db" ]]; then
+        "$VENV_PY" -c "import sqlite3,sys; sys.exit(0 if sqlite3.connect(sys.argv[1]).execute('pragma integrity_check').fetchone()[0]=='ok' else 1)" "$tmp/x/tgyt.db" ||
+            die "The database inside the off-site backup fails its integrity check."
+    fi
+    [[ -f "$tmp/x/fernet.key" ]] || die "The off-site backup has no Fernet key."
+    if cmp -s "$tmp/x/fernet.key" "$(env_val FERNET_KEY_PATH)"; then ok "Fernet key in the backup matches this server's key."
+    else warn "The Fernet key in the backup differs from this server's key (expected only after a restore or reinstall)."; fi
+    ok "Restore test passed: downloaded, decrypted, checksums and database verified ($(sed -n 's/^created=//p' "$tmp/x/MANIFEST.txt"))."
+    wipe_dir "$tmp"; trap - EXIT
+}
+
+offsite_restore() {
+    offsite_configured || die "Off-site backup is not set up on this server." \
+        "On a new server: install first, then run 'sudo tgyt offsite setup' with the SAME bucket and password."
+    local tmp archive keep
+    tmp="$(mktemp -d)"
+    # shellcheck disable=SC2064
+    trap "wipe_dir '$tmp'" EXIT
+    archive="$(offsite_fetch_latest "$tmp")"
+    [[ -n "$archive" ]] || die "The latest snapshot contains no backup archive."
+    keep="$BACKUP_DIR/offsite-restore-$(date +%Y%m%d-%H%M%S).tar.gz"
+    install -d -m 0700 "$BACKUP_DIR"
+    install -m 0600 "$archive" "$keep"
+    wipe_dir "$tmp"; trap - EXIT
+    ok "Downloaded the latest off-site backup to $keep"
+    cmd_restore "$keep"
+}
+
+cmd_offsite() {
+    need_root offsite "$@"
+    offsite_register_secrets
+    case "${1:-status}" in
+        setup) offsite_setup ;;
+        run | now) offsite_run ;;
+        status) offsite_status ;;
+        restore-test | test) offsite_restore_test ;;
+        restore) offsite_restore ;;
+        *) die "Usage: tgyt offsite setup | run | status | restore-test | restore" ;;
+    esac
+}
+
+# Nightly job (tgyt-backup.service): local copy, then off-site if configured. Tells the owner on Telegram when it fails.
+# An EXIT trap (not ERR): die() calls exit, which an ERR trap would never see.
+backup_scheduled() {
+    offsite_register_secrets
+    trap 'rc=$?; ((rc == 0)) || notify_owner "⚠️ TG→YT nightly backup FAILED on $(hostname). Check on the server: sudo journalctl -u tgyt-backup -n 50"' EXIT
+    cmd_backup --quiet --keep 7
+    if offsite_configured; then offsite_run; fi
+}
+
+# =========================================================================================
+health_ok() {  # healthy = active for ~20s, no restarts, panel answers, no fatal lines since $1
+    local since="$1" i code=""
+    for i in $(seq 1 24); do
+        sleep 3
+        systemctl is-active --quiet tgyt || continue
+        code="$(curl -ksS -o /dev/null -w '%{http_code}' --max-time 5 "$(internal_url)/login" 2>/dev/null || true)"
+        [[ "$code" == "200" ]] && break
+    done
+    [[ "$code" == "200" ]] || return 1
+    sleep 12
+    systemctl is-active --quiet tgyt || return 1
+    [[ "$(systemctl show tgyt -p NRestarts --value)" -le "${2:-0}" ]] || return 1
+    ! journalctl -u tgyt --since "$since" --no-pager -o cat 2>/dev/null | grep -Eiq 'traceback|fatal:'
+}
+
+snapshot() {  # snapshot -> creates $ROLLBACK_DIR/<ts>, echoes path
+    local ts dir; ts="$(date +%Y%m%d-%H%M%S)"; dir="$ROLLBACK_DIR/$ts"
+    mkdir -p "$dir"; chmod 700 "$ROLLBACK_DIR"
+    cp -al "$INSTALL_DIR" "$dir/app"          # hard links: instant and space-free; pip replaces files, never edits in place
+    make_backup "$dir" 0 >/dev/null
+    [[ -d "$SRC_DIR/.git" ]] && git -C "$SRC_DIR" rev-parse HEAD >"$dir/src-commit" 2>/dev/null || true
+    echo "$VERSION" >"$dir/version"
+    # keep the two newest snapshots
+    # shellcheck disable=SC2012
+    ls -1dt "$ROLLBACK_DIR"/*/ 2>/dev/null | tail -n +3 | xargs -r rm -rf --
+    printf '%s' "$dir"
+}
+
+restore_snapshot() {
+    local dir="$1" archive
+    [[ -d "$dir/app" ]] || die "Snapshot $dir is incomplete."
+    systemctl stop tgyt || true
+    rsync -a --delete "$dir/app/" "$INSTALL_DIR/"
+    # shellcheck disable=SC2012  # our own timestamp-named files only
+    archive="$(ls -1 "$dir"/tgyt-backup-*.tar.gz | head -n1)"
+    if [[ -f "$archive" ]]; then
+        local t; t="$(mktemp -d)"; tar -xzf "$archive" -C "$t" ./tgyt.db 2>/dev/null || true
+        if [[ -f "$t/tgyt.db" ]]; then
+            local db; db="$(env_val DB_PATH)"; rm -f "$db-wal" "$db-shm"
+            install -m 0640 -o "$SERVICE_USER" -g "$SERVICE_USER" "$t/tgyt.db" "$db"
+        fi
+        rm -rf "$t"
+    fi
+    chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
+    ln -sf "$INSTALL_DIR/deploy/tgyt" /usr/local/bin/tgyt
+    systemctl start tgyt
+}
+
+cmd_update() {
+    need_root update "$@"
+    local ref="" from="" yes=0
+    while (($#)); do case "$1" in --ref) ref="${2:?}"; shift ;; --from) from="${2:?}"; shift ;; -y | --yes) yes=1 ;; esac; shift; done
+    local old_version="$VERSION" old_commit=""
+    [[ -d "$SRC_DIR/.git" ]] && old_commit="$(git -C "$SRC_DIR" rev-parse --short HEAD 2>/dev/null || true)"
+
+    # 1. get the new source
+    if [[ -n "$from" ]]; then
+        [[ -f "$from/VERSION" && -d "$from/deploy" ]] || die "'$from' does not look like a TG→YT Uploader source folder."
+        rsync -a --delete --exclude '__pycache__' --exclude '.pytest_cache' "$from/" "$SRC_DIR/"
+        info "Using local source: $from"
+    elif [[ -d "$SRC_DIR/.git" ]]; then
+        retry 3 5 "Fetching the latest version" git -C "$SRC_DIR" fetch --tags --prune origin || die "Could not reach the repository."
+        local target="${ref:-}"
+        if [[ -z "$target" ]]; then
+            target="$(git -C "$SRC_DIR" tag --sort=-v:refname | head -n1)"
+            [[ -n "$target" ]] || target="origin/$(git -C "$SRC_DIR" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || echo main)"
+        fi
+        git -C "$SRC_DIR" rev-parse --verify --quiet "$target^{commit}" >/dev/null || [[ "$target" == origin/* ]] ||
+            die "Unknown version/ref '$target'."
+        if [[ "$(git -C "$SRC_DIR" rev-parse "$target^{commit}")" == "$(git -C "$SRC_DIR" rev-parse HEAD)" && -z "$from" ]]; then
+            ok "Already up to date (v$old_version, $old_commit)."; return 0
+        fi
+        echo "  Changes since your version:"
+        git -C "$SRC_DIR" log --oneline --no-decorate "HEAD..$target^{commit}" 2>/dev/null | head -n 15 | sed 's/^/     /' || true
+        if ((! yes)) && is_interactive; then confirm "Install $target?" y || { say "  Cancelled."; return 0; }; fi
+        git -C "$SRC_DIR" checkout -q --force "$target^{commit}"
+    else
+        die "$SRC_DIR is not a git checkout, so I can't pull updates." \
+            "Download the new release, unpack it, and run:  sudo tgyt update --from /path/to/unpacked/folder"
+    fi
+    local new_version; new_version="$(tr -d '[:space:]' <"$SRC_DIR/VERSION")"
+
+    # 2. rollback snapshot (code + venv + database + keys)
+    local snap; snap="$(snapshot)"
+    ok "Rollback copy saved: $snap"
+    local since; since="$(date '+%Y-%m-%d %H:%M:%S')"
+
+    # 3. install
+    if ! { systemctl stop tgyt
+        rsync -a --delete --exclude 'venv' --exclude '.venv' --exclude '.git' --exclude '__pycache__' --exclude 'tests' "$SRC_DIR/" "$INSTALL_DIR/" &&
+        chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR" && chmod 0755 "$INSTALL_DIR/deploy/tgyt" &&
+        ln -sf "$INSTALL_DIR/deploy/tgyt" /usr/local/bin/tgyt &&
+        retry 3 10 "Updating Python dependencies" as_service "$VENV_PY" -m pip install --quiet -r "$INSTALL_DIR/requirements.txt" &&
+        { [[ ! -f "$INSTALL_DIR/requirements-optional.txt" ]] || run "Optional speed-ups" as_service "$VENV_PY" -m pip install --quiet -r "$INSTALL_DIR/requirements-optional.txt" || true; } &&
+        run "Applying database migrations" as_service env TGYT_ENV_FILE="$ENV_FILE" "$VENV_PY" "$INSTALL_DIR/tools/migrate_db.py"; }; then
+        err "The update failed part-way."
+        update_rollback "$snap" "$old_version" "$old_commit"
+        return 1
+    fi
+    install -m 0644 "$INSTALL_DIR/deploy/tgyt.service" /etc/systemd/system/tgyt.service
+    install -m 0644 "$INSTALL_DIR/deploy/tgyt-backup.service" "$INSTALL_DIR/deploy/tgyt-backup.timer" /etc/systemd/system/
+    systemctl daemon-reload
+    systemctl start tgyt
+
+    # 4. health check; roll back automatically on failure
+    if run "Waiting for the new version to prove itself (up to ~1.5 min)" health_ok "$since" 0; then
+        ok "Updated: v$old_version → v$new_version. Previous version kept for 'tgyt rollback'."
+        [[ -f "$INSTALL_DIR/deploy/nginx.conf" ]] && info "If this release changed the web server config, re-run: sudo $INSTALL_DIR/deploy/install.sh (keeps your settings)."
+    else
+        err "The new version did not pass the health check."
+        update_rollback "$snap" "$old_version" "$old_commit"
+        return 1
+    fi
+}
+
+update_rollback() {
+    local snap="$1" old_version="$2" old_commit="$3"
+    warn "Rolling back to v$old_version automatically..."
+    restore_snapshot "$snap"
+    [[ -n "$old_commit" && -d "$SRC_DIR/.git" ]] && git -C "$SRC_DIR" checkout -q --force "$old_commit" 2>/dev/null || true
+    if wait_for 40 3 systemctl is-active --quiet tgyt; then ok "Rolled back: v$old_version is running again. Your data is intact."; else err "Rollback finished but the service is not active: tgyt logs"; fi
+    info "Details: journalctl -u tgyt -n 100   and   $LOG_FILE"
+}
+
+cmd_rollback() {
+    need_root rollback
+    local snap
+    # shellcheck disable=SC2012
+    snap="$(ls -1dt "$ROLLBACK_DIR"/*/ 2>/dev/null | head -n1 || true)"
+    [[ -n "$snap" ]] || die "No rollback copy found in $ROLLBACK_DIR."
+    info "Latest rollback copy: $snap (version $(cat "$snap/version" 2>/dev/null || echo ?))"
+    confirm "Restore that version of the code AND the database from that moment?" n || { say "  Cancelled."; return 0; }
+    restore_snapshot "${snap%/}"
+    [[ -f "$snap/src-commit" && -d "$SRC_DIR/.git" ]] && git -C "$SRC_DIR" checkout -q --force "$(cat "$snap/src-commit")" 2>/dev/null || true
+    ok "Rolled back."
+}
+
+# =========================================================================================
+cmd_uninstall() {
+    need_root uninstall
+    echo "${C_BOLD}${C_RED}Uninstall TG → YT Uploader${C_OFF}"
+    echo "  This removes the service and application. Your data is only deleted if you say so below."
+    confirm "Continue?" n || { say "  Cancelled."; return 0; }
+    if confirm "Make a final backup first (database + keys)?" y; then
+        local a; a="$(make_backup "/root" 0)"; ok "Final backup: $a   (keep it safe — it contains your keys)"
+    fi
+    local del_data=0 del_env=0 del_certs=0 del_user=0
+    confirm "Delete the DATABASE and downloaded videos in /var/lib/tgyt?" n && del_data=1
+    confirm "Delete the settings and Fernet KEY in /etc/tgyt? (saved YouTube logins become permanently unreadable)" n && del_env=1
+    confirm "Delete the Let's Encrypt certificate for $(env_val PUBLIC_HOST)?" n && del_certs=1
+    confirm "Delete the 'tgyt' system user?" n && del_user=1
+    if ((del_data || del_env)); then
+        local ans; read -r -p "  Type DELETE to confirm the permanent deletion you selected: " ans
+        [[ "$ans" == "DELETE" ]] || { say "  Cancelled. Nothing was removed."; return 0; }
+    fi
+    local host; host="$(env_val PUBLIC_HOST)"
+    systemctl disable --now tgyt tgyt-backup.timer 2>/dev/null || true
+    rm -f /etc/systemd/system/tgyt.service /etc/systemd/system/tgyt-backup.service /etc/systemd/system/tgyt-backup.timer
+    rm -rf /etc/systemd/system/tgyt.service.d /etc/sudoers.d/tgyt-restart /etc/tmpfiles.d/tgyt.conf /etc/fail2ban/jail.d/tgyt.local
+    rm -f /etc/nginx/sites-enabled/tgyt.conf /etc/nginx/sites-available/tgyt.conf
+    systemctl reload nginx 2>/dev/null || true
+    systemctl daemon-reload
+    rm -rf "$INSTALL_DIR" "$SRC_DIR" "$ROLLBACK_DIR" /usr/local/bin/tgyt
+    ((del_data)) && rm -rf /var/lib/tgyt && ok "Data deleted."
+    ((del_env)) && rm -rf "$ENV_DIR" && ok "Settings and key deleted."
+    ((del_certs)) && [[ -n "$host" ]] && certbot delete --cert-name "$host" --non-interactive >/dev/null 2>&1 && ok "Certificate deleted."
+    ((del_user)) && userdel -r tgyt 2>/dev/null && ok "User removed."
+    ok "Uninstalled. Left in place on purpose: nginx, ufw/fail2ban settings, apt packages, backups in $BACKUP_DIR."
+    ((del_data)) || info "Your data is still in /var/lib/tgyt."
+}
+
+# =========================================================================================
+init_log
+case "${1:-help}" in
+    status) shift; cmd_status "$@" ;;
+    logs) shift; cmd_logs "$@" ;;
+    start | stop | restart) cmd_service "$@" ;;
+    doctor) shift; cmd_doctor "$@" ;;
+    config) shift; cmd_config "$@" ;;
+    relay) cmd_relay ;;
+    relay-test) shift; cmd_relay_test "$@" ;;
+    admin) cmd_admin ;;
+    backup) shift; cmd_backup "$@" ;;
+    offsite) shift; cmd_offsite "$@" ;;
+    restore) shift; cmd_restore "$@" ;;
+    update | upgrade) shift; cmd_update "$@" ;;
+    rollback) cmd_rollback ;;
+    uninstall) cmd_uninstall ;;
+    version | --version | -v) echo "tgyt v$VERSION" ;;
+    help | --help | -h) usage ;;
+    *) echo "Unknown command: $1" >&2; usage >&2; exit 2 ;;
+esac

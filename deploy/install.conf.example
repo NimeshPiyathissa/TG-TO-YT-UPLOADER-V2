@@ -1,0 +1,42 @@
+# Non-interactive install:  sudo ./install.sh --config install.conf
+# Copy this file, fill in REAL values, keep it chmod 600 and DELETE it after the install.
+# Every key can alternatively be given as an environment variable of the same name.
+
+# domain | sslip | loopback
+TGYT_ACCESS_MODE=domain
+TGYT_DOMAIN=upload.example.com
+# Optional; auto-detected when omitted.
+# TGYT_PUBLIC_IP=203.0.113.10
+TGYT_LE_EMAIL=you@example.com
+
+TGYT_BOT_TOKEN=123456789:AAH-fake-token-for-documentation-only
+TGYT_API_ID=1234567
+TGYT_API_HASH=0123456789abcdef0123456789abcdef
+TGYT_OWNER_ID=123456789
+
+TGYT_ADMIN_USER=admin
+# At least 12 characters, 3 of: lowercase, UPPERCASE, digits, symbols.
+TGYT_ADMIN_PASSWORD=change-me-Please-123
+TGYT_REQUIRE_TOTP=true
+
+TGYT_REGION=US
+TGYT_WEB_PORT=443
+TGYT_MAX_FILE_BYTES=2147483648
+
+# Relay: yes (interactive login; not possible unattended) | no | preset (use the two values below)
+TGYT_SETUP_RELAY=no
+# TGYT_USER_SESSION=
+# TGYT_RELAY_CHAT_ID=-1001234567890
+
+TGYT_ENABLE_FIREWALL=yes
+TGYT_ENABLE_FAIL2BAN=yes
+TGYT_BACKUP_SCHEDULE=yes
+# Only set to yes if you have verified key-based SSH login works (see docs):
+TGYT_HARDEN_SSH=no
+# TGYT_SSH_KEY_CONFIRMED=yes
+
+# Testing/CI switches:
+# TGYT_SKIP_DNS_CHECK=1
+# TGYT_SKIP_CERT=1
+# TGYT_LE_STAGING=1
+# TGYT_RECONFIGURE=yes      (re-apply these answers over an existing installation)

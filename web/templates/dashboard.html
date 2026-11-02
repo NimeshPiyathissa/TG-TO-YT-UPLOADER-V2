@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — TG→YT Uploader{% endblock %}
+{% block head_scripts %}<script src="{{ asset('live.js') }}" defer></script>{% endblock %}
+{% block content %}
+<header class="top rise" style="--i:0">
+  <div>
+    <h1>Dashboard</h1>
+    <div class="sub">
+      <span class="pill"><i></i>{{ "Bot up" if bot_up else "Bot down" }} · <span data-uptime="{{ uptime_s }}">{{ uptime }}</span></span>
+      <span class="pill is-off" id="live-pill" title="Live progress updates"><i></i><span>Connecting…</span></span>
+    </div>
+  </div>
+</header>
+
+<div id="dashboard-live" class="rise" style="--i:1" data-live-region data-live-all
+     hx-get="/partials/dashboard-jobs" hx-trigger="every 30s, every 3s [!window.__sseLive]" hx-swap="innerHTML">
+  {% include "partials/dashboard_live.html" %}
+</div>
+{% endblock %}

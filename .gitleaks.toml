@@ -1,0 +1,20 @@
+# Allowlist for the obviously fake placeholder values used in docs and tests.
+# Real secrets are never allowlisted: only these exact, documented fake patterns.
+title = "tgyt-uploader gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "documented fake placeholders"
+regexes = [
+  '''0123456789abcdef0123456789abcdef''',
+  '''0123456789ABCDEF0123456789ABCDEF''',
+  '''0123456789abcdef''',
+  '''fedcba9876543210fedcba9876543210''',
+  '''AAH-fake[A-Za-z0-9_-]*''',
+  '''123456789:AAH-fake[A-Za-z0-9_-]*''',
+]
+paths = [
+  '''(^|/)__pycache__/''',
+]

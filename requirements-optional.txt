@@ -1,0 +1,3 @@
+# Optional speed-up for Telegram encryption. The app works without it (pure-Python fallback),
+# so a failed build here is not fatal. Needs a C compiler (build-essential, installed by the installer).
+tgcrypto==1.2.5

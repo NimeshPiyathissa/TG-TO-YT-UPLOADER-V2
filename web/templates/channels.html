@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% block title %}Channels — TG→YT Uploader{% endblock %}
+{% block content %}
+{% from "partials/_icons.html" import icon %}
+<div class="page-header">
+  <div>
+    <h1>Channels</h1>
+    <div class="sub">{{ channels|length }} linked · {{ channels|selectattr("status", "equalto", "active")|list|length }} active · the bot asks which channel for each video, default first · <a href="/help/linking-channels">Linking more channels</a></div>
+  </div>
+  <a href="/channels/add" class="btn btn-primary">{{ icon("plus") }}Link a channel</a>
+</div>
+{% if channels %}
+{% for email, members in groups %}
+<section class="account-group">
+  <h2 class="account-head">
+    <span class="account-email{{ '' if email else ' account-unrecorded' }}">{{ email or unrecorded_label }}</span>
+    <span class="account-count">{{ members|length }} channel{{ "" if members|length == 1 else "s" }}</span>
+  </h2>
+  {% if not email %}<p class="sub">Re-authorize each of these channels (leave the email permission ticked) and they move under their Google account.</p>{% endif %}
+<div class="channel-grid">
+  {% for c in members %}
+  <div class="card channel-card">
+    <div class="channel-top">
+      {% if c.thumbnail_url %}<img src="{{ c.thumbnail_url }}" class="channel-thumb" alt="">
+      {% else %}<span class="channel-initial" aria-hidden="true">{{ (c.channel_title or "?")[:1]|upper }}</span>{% endif %}
+      <div class="channel-id">
+        <div class="channel-title">{{ c.channel_title }}{% if c.is_default %} <span class="chip-default">{{ icon("star") }}Default</span>{% endif %}</div>
+        <div class="channel-handle">{{ c.handle or "No handle" }}{% if c.display_label %} · YouTube name: {{ c.youtube_title }}{% endif %}</div>
+      </div>
+      <span class="badge badge-{{ c.status }} channel-status">{{ c.status|replace("_", " ") }}</span>
+    </div>
+    <div class="channel-stats">
+      <div><b>{{ c.uploads_count }}</b><span>Uploads</span></div>
+      <div><b>{{ (c.subscriber_count|thousands) if c.subscriber_count is not none else "—" }}</b><span title="Snapshot from the last time this channel was linked">Subscribers</span></div>
+      <div><b>{{ c.last_used_at[:10] if c.last_used_at else "never" }}</b><span>Last used</span></div>
+    </div>
+    {% if not delete_ok.get(c.id, true) %}
+    <p class="sub">Deleting videos from YouTube needs a newer permission: use Re-authorize and leave every box ticked.</p>
+    {% endif %}
+    <div class="card-actions">
+      {% if not c.is_default and c.status == "active" %}
+      <form method="post" action="/channels/{{ c.id }}/set-default" class="inline-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+        <button type="submit" class="link-btn">Set default</button>
+      </form>
+      {% endif %}
+      <form method="post" action="/channels/{{ c.id }}/reauthorize" class="inline-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+        <button type="submit" class="link-btn" title="In Google's chooser, pick this same channel again">Re-authorize</button>
+      </form>
+      <button type="button" class="link-btn link-btn-danger"
+              hx-get="/channels/{{ c.id }}/remove-confirm" hx-target="#confirm-{{ c.id }}" hx-swap="innerHTML">
+        Remove
+      </button>
+    </div>
+    <form method="post" action="/channels/{{ c.id }}/label" class="label-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+      <input type="text" name="label" value="{{ c.display_label or '' }}" maxlength="60"
+             placeholder="Display label (shown in the bot)" aria-label="Display label for {{ c.youtube_title }}">
+      <button type="submit" class="btn">Save</button>
+    </form>
+    <div id="confirm-{{ c.id }}"></div>
+  </div>
+  {% endfor %}
+  {% if email %}
+  <form method="post" action="{{ '/channels/link/start' if oauth_mode == 'hostname' else '/channels/link/loopback/start' }}" class="channel-add channel-add-account">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token(request) }}">
+    <input type="hidden" name="login_hint" value="{{ email }}">
+    <button type="submit" class="tile-btn">{{ icon("plus") }}<span>Add another channel from this account</span></button>
+  </form>
+  {% endif %}
+</div>
+</section>
+{% endfor %}
+<p><a href="/channels/add" class="btn">{{ icon("plus") }}Link a channel from another Google account</a></p>
+<section class="panel">
+  <h2>Shared quota</h2>
+  <p class="quota-note"><b>{{ general_used|thousands }}</b> of {{ general_limit|thousands }} units used today ·
+     <b>{{ uploads_remaining }}</b> of {{ uploads_limit }} uploads left today.
+     This is <b>one pool shared by every channel</b>, because quota belongs to the Google Cloud project, not to a channel.
+     The upload counts above are per channel; the quota is not.</p>
+</section>
+{% else %}
+<div class="empty-state">
+  <span class="ico">{{ icon("chan") }}</span>
+  <h3>No channels linked yet</h3>
+  <p>Link a YouTube channel and anything sent to the bot can be uploaded to it.</p>
+  <a href="/channels/add" class="btn btn-primary">{{ icon("plus") }}Link a channel</a>
+</div>
+{% endif %}
+{% endblock %}
