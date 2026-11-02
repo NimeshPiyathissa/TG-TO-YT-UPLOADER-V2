@@ -247,3 +247,107 @@ def test_offsite_restore_test_passes_on_good_snapshot(cli, tmp_path):
               'offsite_restore_test')
     assert res.returncode == 0, res.stderr
     assert "Restore test passed" in res.stdout + res.stderr
+
+
+def test_update_picks_newest_stable_tag_and_ignores_prereleases(cli, tmp_path):
+    """`tgyt update` without --ref must never offer an -rc/-beta tag, and a final release must beat its own rc."""
+    run, _, _ = cli
+    script = (
+        'mkdir repo && cd repo && git init -q && git -c user.name=t -c user.email=t@example.com commit -q --allow-empty -m x\n'
+        'for t in v1.0.0 v1.0.1 v1.1.0-rc.1; do git tag "$t"; done\n'
+        'echo "A=$(latest_release_tag .)"\n'
+        'git tag v1.1.0; echo "B=$(latest_release_tag .)"\n'
+        'git tag v1.2.0-beta.1; echo "C=$(latest_release_tag .)"\n'
+        'cd .. && mkdir empty && cd empty && git init -q && echo "D=[$(latest_release_tag .)]"\n'
+    )
+    res = run(script)
+    assert res.returncode == 0, res.stderr
+    assert "A=v1.0.1" in res.stdout          # rc.1 of the next version is not offered
+    assert "B=v1.1.0" in res.stdout          # the final beats its rc
+    assert "C=v1.1.0" in res.stdout          # a newer beta is still not offered
+    assert "D=[]" in res.stdout              # no tags: empty, caller falls back to the default branch
+
+
+# --- `tgyt update` must never install a GitHub pre-release on its own, even one tagged like a stable version -------
+# GitHub's API is replaced by a shell function, so these tests never touch the network.
+
+FAKE_GITHUB = r'''
+curl() {   # fake GitHub API: FAKE_CODE = HTTP status (000 = unreachable), FAKE_BODY = response
+    local out=""; while (($#)); do [[ "$1" == "-o" ]] && { out="$2"; shift; }; shift; done
+    echo called >> "$PWD/../curl.calls"
+    [[ -n "${FAKE_BODY:-}" && -n "$out" ]] && printf '%s' "$FAKE_BODY" > "$out"
+    printf '%s' "$FAKE_CODE"
+}
+'''
+
+HISTORY = (
+    'rm -rf repo && mkdir repo && cd repo && git init -q && git remote add origin "$ORIGIN"\n'
+    'c() { git -c user.name=t -c user.email=t@example.com commit -q --allow-empty -m "$1"; }\n'
+    'c one; git tag v0.9.0; c two; git tag v1.0.0; c three; git tag "$PRE"\n'   # PRE = the GitHub pre-release
+)
+
+
+def stable(tag):
+    return f'{{\n  "url": "x",\n  "tag_name": "{tag}",\n  "prerelease": false,\n  "draft": false\n}}'
+
+
+def choose(run, *, pre="v1.0.1", on="v0.9.0", code="200", body=None, origin="https://github.com/o/r.git"):
+    script = FAKE_GITHUB + HISTORY + f'git checkout -q "{on}"\nrc=0; choose_update_target . || rc=$?; echo "rc=$rc"\n'
+    env = f'export ORIGIN="{origin}" PRE="{pre}" FAKE_CODE="{code}"\n'
+    if body is not None:
+        env += f"export FAKE_BODY='{body}'\n"
+    res = run(env + script)
+    assert res.returncode == 0, res.stderr
+    return res.stdout.strip().splitlines()
+
+
+def test_prerelease_with_a_stable_looking_tag_is_not_installed(cli):
+    # v1.0.1 exists as a tag but is a GitHub PRE-release; the latest stable release is v1.0.0
+    assert choose(cli[0], pre="v1.0.1", body=stable("v1.0.0")) == ["REF v1.0.0", "rc=0"]
+
+
+def test_rc_prerelease_is_not_installed(cli):
+    assert choose(cli[0], pre="v1.0.1-rc.1", body=stable("v1.0.0")) == ["REF v1.0.0", "rc=0"]
+
+
+def test_only_prereleases_published_installs_nothing(cli):
+    assert choose(cli[0], code="404", body='{"message": "Not Found"}') == ["NONE", "rc=0"]
+
+
+def test_github_unreachable_changes_nothing(cli):
+    for code in ("000", "403", "503"):
+        assert choose(cli[0], code=code) == ["rc=1"]
+
+
+def test_never_downgrades_a_server_running_the_prerelease(cli):
+    assert choose(cli[0], on="v1.0.1", body=stable("v1.0.0")) == ["NEWER v1.0.0", "rc=0"]
+
+
+def test_already_on_latest_stable(cli):
+    assert choose(cli[0], on="v1.0.0", body=stable("v1.0.0")) == ["CURRENT", "rc=0"]
+
+
+def test_compact_json_from_the_api(cli):
+    assert choose(cli[0], body='{"tag_name":"v1.0.0","prerelease":false}') == ["REF v1.0.0", "rc=0"]
+
+
+def test_non_github_origin_uses_stable_tag_names_without_asking_github(cli, tmp_path):
+    run = cli[0]
+    lines = choose(run, pre="v1.0.1-rc.1", origin="https://git.example.com/o/r.git", code="500")
+    assert lines == ["REF v1.0.0", "rc=0"]
+    assert not (tmp_path / "curl.calls").exists()
+
+
+def test_github_repo_of_understands_every_url_form(cli):
+    run = cli[0]
+    urls = {
+        "https://github.com/O/R.git": "O/R", "https://github.com/O/R": "O/R", "https://github.com/O/R/": "O/R",
+        "git@github.com:O/R.git": "O/R", "ssh://git@github.com/O/R.git": "O/R",
+        "https://gitlab.com/O/R.git": "", "https://github.com.evil.example/O/R.git": "",
+    }
+    script = "mkdir g && cd g && git init -q\n" + "".join(
+        f'git remote remove origin 2>/dev/null || true; git remote add origin "{u}"; echo "{u} => [$(github_repo_of .)]"\n' for u in urls)
+    res = run(script)
+    assert res.returncode == 0, res.stderr
+    for u, want in urls.items():
+        assert f"{u} => [{want}]" in res.stdout

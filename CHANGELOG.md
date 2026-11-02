@@ -18,6 +18,10 @@ All notable changes to this project. Format based on [Keep a Changelog](https://
   `Referrer-Policy: same-origin`, on every response.
 
 ### Fixed
+- `tgyt update` without `--ref` installs only the newest **stable** release: on GitHub it asks for the latest release, which never
+  includes pre-releases (even one tagged like `v1.0.1`); elsewhere it skips `-rc`/`-beta` tags. It changes nothing when GitHub can't be
+  reached or no stable release exists, and never downgrades a server that runs a pre-release. Before, it took the highest tag, and git
+  ranks `v1.1.0-rc.1` above `v1.1.0`.
 - `/jobs` and `/cancel <id>` got no reply: the title step's text handler matched every text message, commands included, and
   Kurigram runs only the first matching handler, so the commands registered after it never ran. Commands are now excluded from it,
   and one function (`bot.handlers.register_all`) fixes the order for the bot and the tests. `/jobs` now shows active uploads with

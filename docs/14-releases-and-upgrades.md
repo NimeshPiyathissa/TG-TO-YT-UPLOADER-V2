@@ -13,11 +13,16 @@ How versions are numbered, how a server gets a new version, and how to go back i
 ## Updating a server
 
 ```bash
-sudo tgyt update                   # newest tagged release: lists the changes, asks, then upgrades
-sudo tgyt update --ref v1.0.1      # a specific tag (or branch/commit)
+sudo tgyt update                   # newest STABLE release: lists the changes, asks, then upgrades
+sudo tgyt update --ref v1.0.1      # a specific tag (or branch/commit); also the only way to install a pre-release such as v1.1.0-rc.1
 sudo tgyt update -y                # don't ask (for scripts)
 sudo tgyt update --from /path/to/unpacked/source    # install from a folder instead of Git (offline or private copies)
 ```
+
+**Which version is "newest stable":** for a GitHub repository, the one GitHub calls the latest release. GitHub never counts
+pre-releases or drafts, so a pre-release is not installed even if its tag looks stable (`v1.0.1`). For other Git hosts, the highest plain
+`vX.Y.Z` tag (`-rc`, `-beta` tags are skipped). If GitHub can't be reached, nothing changes; if no stable release exists yet, nothing
+changes; and a server already running something newer (e.g. a pre-release installed with `--ref`) is never downgraded.
 
 What `tgyt update` does, in order:
 

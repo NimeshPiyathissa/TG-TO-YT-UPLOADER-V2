@@ -752,6 +752,55 @@ restore_snapshot() {
     systemctl start tgyt
 }
 
+# Newest stable release tag (vX.Y.Z) in a checkout, or nothing. Pre-release tags (v1.1.0-rc.1, -beta...) are
+# skipped: git's version sort puts them ABOVE the final release, so they would be offered instead of it.
+# Install one on purpose with: tgyt update --ref v1.1.0-rc.1
+latest_release_tag() {  # latest_release_tag DIR
+    git -C "$1" tag --list 'v[0-9]*' --sort=-v:refname 2>/dev/null | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | head -n1
+}
+
+# owner/repo when the checkout's origin is on GitHub, otherwise nothing.
+github_repo_of() {  # github_repo_of DIR
+    git -C "$1" remote get-url origin 2>/dev/null | sed -E 's#/+$##; s#\.git$##' |
+        sed -nE 's#^(https://github\.com/|git@github\.com:|ssh://git@github\.com/)([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)$#\2#p' || true
+}
+
+# The tag of the newest STABLE release. On GitHub a pre-release can carry a normal tag like v1.0.1, so tag names alone can't
+# tell; GitHub's /releases/latest never returns pre-releases or drafts. Prints nothing when no stable release is published.
+# Returns 1 when GitHub can't be asked, so the caller can stop instead of guessing.
+stable_release_tag() {  # stable_release_tag DIR
+    local repo body code
+    repo="$(github_repo_of "$1")"
+    if [[ -z "$repo" ]]; then latest_release_tag "$1"; return 0; fi
+    body="$(mktemp)"
+    code="$(curl -sS -m 20 -o "$body" -w '%{http_code}' -H 'Accept: application/vnd.github+json' \
+        "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null || true)"
+    case "$code" in
+        200) { grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' "$body" || true; } | head -n1 | sed -E 's/.*"([^"]+)"$/\1/' ;;
+        404) ;;                        # no stable release published yet (or a private repository)
+        *) rm -f "$body"; return 1 ;;
+    esac
+    rm -f "$body"
+}
+
+# What `tgyt update` without --ref should install. Prints one of:
+#   REF <ref>   install it        NONE       no stable release to install
+#   CURRENT     already on it     NEWER <tag>  this server runs something newer (e.g. a pre-release): never downgrade
+# Returns 1 when the latest stable release can't be determined.
+choose_update_target() {  # choose_update_target DIR
+    local dir="$1" tag
+    tag="$(stable_release_tag "$dir")" || return 1
+    if [[ -z "$tag" ]]; then
+        if [[ -n "$(github_repo_of "$dir")" ]]; then echo NONE; return 0; fi
+        echo "REF origin/$(git -C "$dir" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || echo main)"
+        return 0
+    fi
+    git -C "$dir" rev-parse --verify --quiet "$tag^{commit}" >/dev/null || { echo "REF $tag"; return 0; }   # caller reports unknown refs
+    if [[ "$(git -C "$dir" rev-parse "$tag^{commit}")" == "$(git -C "$dir" rev-parse HEAD)" ]]; then echo CURRENT
+    elif git -C "$dir" merge-base --is-ancestor "$tag^{commit}" HEAD 2>/dev/null; then echo "NEWER $tag"
+    else echo "REF $tag"; fi
+}
+
 cmd_update() {
     need_root update "$@"
     local ref="" from="" yes=0
@@ -768,8 +817,17 @@ cmd_update() {
         retry 3 5 "Fetching the latest version" git -C "$SRC_DIR" fetch --tags --prune origin || die "Could not reach the repository."
         local target="${ref:-}"
         if [[ -z "$target" ]]; then
-            target="$(git -C "$SRC_DIR" tag --sort=-v:refname | head -n1)"
-            [[ -n "$target" ]] || target="origin/$(git -C "$SRC_DIR" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || echo main)"
+            local choice
+            choice="$(choose_update_target "$SRC_DIR")" ||
+                die "Could not ask GitHub which release is the latest stable one, so nothing was changed." \
+                    "Try again later, or install a specific version on purpose: sudo tgyt update --ref vX.Y.Z"
+            case "$choice" in
+                NONE) ok "No stable release is published yet; pre-releases are only installed on request. Nothing changed."
+                      info "To install one anyway: sudo tgyt update --ref vX.Y.Z"; return 0 ;;
+                CURRENT) ok "Already on the latest stable release (v$old_version, $old_commit)."; return 0 ;;
+                NEWER\ *) ok "This server runs a newer version than the latest stable release (${choice#NEWER }). Nothing changed."; return 0 ;;
+                REF\ *) target="${choice#REF }" ;;
+            esac
         fi
         git -C "$SRC_DIR" rev-parse --verify --quiet "$target^{commit}" >/dev/null || [[ "$target" == origin/* ]] ||
             die "Unknown version/ref '$target'."
