@@ -39,8 +39,12 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get install -y shellcheck
-      - run: shellcheck -x -P deploy install.sh deploy/install.sh deploy/tgyt deploy/lib/*.sh
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Pinned: Ubuntu 24.04's apt package is 0.9.0, which also reports SC2015 on deliberate `a && b || true`.
+      - run: pip install shellcheck-py==0.11.0.1
+      - run: shellcheck --version && shellcheck -x -P deploy install.sh deploy/install.sh deploy/tgyt deploy/lib/*.sh
 
   secrets:
     runs-on: ubuntu-24.04

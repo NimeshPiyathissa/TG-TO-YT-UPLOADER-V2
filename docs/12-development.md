@@ -17,7 +17,7 @@ If you only want to *use* the uploader, you don't need this page: follow [Runnin
 | **SQLite** | built into Python; nothing to install. The `sqlite3` command-line tool is handy for inspecting a database. |
 | **FFmpeg** | not needed for development. The installer puts it on servers; the app does not need it to upload. |
 | **C compiler** | only for the optional `tgcrypto` speed-up (`requirements-optional.txt`). Skip it on Windows; the app falls back to pure Python. |
-| **ShellCheck** | to check the shell scripts (`pip install shellcheck-py` gives you a `shellcheck` command on any OS). |
+| **ShellCheck** | 0.11.0, the version CI uses: `pip install shellcheck-py==0.11.0.1` gives you a `shellcheck` command on any OS. Older versions (Ubuntu's apt package is 0.9.0) also report info-level SC2015 notes. |
 | **Bash** | to run the shell-script tests on Windows: Git for Windows includes Git Bash. Without it those tests are skipped. |
 
 To **run** the bot locally (the tests don't need any of this), you also need test credentials, never your production ones:
@@ -44,7 +44,7 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1          # if blocked: Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 python -m pip install --upgrade pip
 pip install -r requirements-dev.txt   # pinned app dependencies + pytest, pytest-asyncio, httpx
-pip install shellcheck-py             # optional: shellcheck for the scripts
+pip install shellcheck-py==0.11.0.1  # optional: the same ShellCheck version CI uses
 
 # 4. Run the tests (about 3 minutes)
 python -m pytest -q
@@ -53,13 +53,14 @@ python -m pytest -q
 ## Linux (Ubuntu) setup
 
 ```bash
-sudo apt update && sudo apt install -y git python3 python3-venv python3-dev build-essential shellcheck sqlite3
+sudo apt update && sudo apt install -y git python3 python3-venv python3-dev build-essential sqlite3
 git clone https://github.com/NimeshPiyathissa/TG-TO-YT-UPLOADER-V2.git
 cd TG-TO-YT-UPLOADER-V2
 python3 -m venv .venv && source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements-dev.txt
 pip install -r requirements-optional.txt     # optional tgcrypto speed-up (needs build-essential)
+pip install shellcheck-py==0.11.0.1          # ShellCheck, same version as CI (Ubuntu's apt package is older)
 python -m pytest -q
 ```
 
